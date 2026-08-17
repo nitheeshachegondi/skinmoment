@@ -1,0 +1,17 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+  }
+}
+
+.gauge-track {
+  stroke: #e7d6d1;
+}
+
+.card-shadow {
+  box-shadow: 0 20px 50px -25px rgba(43, 35, 32, 0.35);
+}
