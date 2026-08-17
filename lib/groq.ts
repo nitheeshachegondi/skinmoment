@@ -12,16 +12,12 @@ import type { SkinMetric } from './youcam';
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GROQ_MODEL = process.env.GROQ_MODEL || 'llama-3.3-70b-versatile';
 
-// Label so callers' catch blocks can log *why* they fell back to the
-// template/heuristic path instead of silently swallowing it. Previously
-// every failure (missing key, bad request, network error, malformed
-// response) was indistinguishable — this made it look like Groq was
-// "working" but just always agreeing, when actually it was never being
-// called successfully.
-export const DEMO_MODE_GROQ = !GROQ_API_KEY;
-
 async function callGroq(systemPrompt: string, userPrompt: string): Promise<string> {
   if (!GROQ_API_KEY) {
+    // Loud on the server so this doesn't get mistaken for a real "good fit"
+    // decision. If you're seeing this in logs, the API key isn't set in
+    // this environment (check Vercel env vars for the right scope/branch).
+    console.warn('[groq] GROQ_API_KEY not set — falling back to heuristic verdicts.');
     throw new Error('NO_GROQ_KEY');
   }
 
@@ -43,17 +39,13 @@ async function callGroq(systemPrompt: string, userPrompt: string): Promise<strin
   });
 
   if (!res.ok) {
-    throw new Error(`Groq request failed: ${res.status} ${await res.text()}`);
+    const errText = await res.text();
+    console.error(`[groq] request failed: ${res.status} ${errText}`);
+    throw new Error(`Groq request failed: ${res.status} ${errText}`);
   }
 
   const data = await res.json();
-  const content = data.choices?.[0]?.message?.content?.trim();
-  if (!content) {
-    // Distinguish "API responded but gave us nothing usable" from a
-    // genuine network/HTTP failure — same visibility problem as above.
-    throw new Error('Groq returned an empty completion');
-  }
-  return content;
+  return data.choices?.[0]?.message?.content?.trim() || '';
 }
 
 function worstMetrics(metrics: SkinMetric[], n = 2): SkinMetric[] {
@@ -74,12 +66,8 @@ export async function generateRightNowPlan(metrics: SkinMetric[]): Promise<strin
     );
     const steps = raw.split('\n').map((l) => l.replace(/^[-*\d.\s]+/, '').trim()).filter(Boolean);
     if (steps.length >= 2) return steps.slice(0, 3);
-    console.error('[groq] generateRightNowPlan: Groq returned too few usable steps, using template', { raw });
-  } catch (err) {
-    // Log the real reason instead of failing silently — a missing/invalid
-    // GROQ_API_KEY, a rate limit, and a genuine network error all need
-    // different fixes, and "fall through to template" was hiding which.
-    console.error('[groq] generateRightNowPlan falling back to template:', err instanceof Error ? err.message : err);
+  } catch {
+    // fall through to template
   }
 
   return priority.map(
@@ -93,146 +81,89 @@ export type PurchaseVerdict = {
   verdict: 'good_fit' | 'caution' | 'poor_fit';
   headline: string;
   reasoning: string;
+  offTopic?: boolean; // true when the product isn't really a skin-metric match (e.g. haircare)
 };
 
-// Two-tier list per concern: `risky` keywords that commonly aggravate a
-// *low*-scoring metric, and `helpful` keywords that address it. Every
-// metric now has coverage (previously moisture/spots/wrinkles/texture had
-// none, so they could never be flagged either way and the heuristic
-// silently degenerated into "always good_fit"). Keyword lists are still
-// necessarily incomplete — this is a fallback for when Groq is
-// unavailable, not a substitute for it — but it now actually varies its
-// answer based on the product text instead of ignoring most of it.
-const RISK_KEYWORDS: Record<string, { risky: string[]; helpful: string[] }> = {
-  moisture: {
-    risky: ['alcohol denat', 'high alcohol', 'clay mask', 'matte'],
-    helpful: ['hyaluronic acid', 'glycerin', 'ceramide', 'squalane', 'humectant']
-  },
-  oiliness: {
-    risky: ['heavy oil', 'petrolatum', 'shea butter', 'coconut oil', 'rich cream'],
-    helpful: ['niacinamide', 'salicylic acid', 'oil-free', 'mattifying', 'clay']
-  },
-  redness: {
-    risky: ['fragrance', 'alcohol denat', 'menthol', 'essential oil', 'exfoliant', 'retinol'],
-    helpful: ['centella', 'cica', 'fragrance-free', 'soothing', 'panthenol', 'oat']
-  },
-  acne: {
-    risky: ['coconut oil', 'isopropyl myristate', 'heavy silicone', 'comedogenic', 'cocoa butter'],
-    helpful: ['salicylic acid', 'benzoyl peroxide', 'niacinamide', 'non-comedogenic', 'tea tree']
-  },
-  spots: {
-    risky: ['no spf', 'fragrance'],
-    helpful: ['vitamin c', 'niacinamide', 'spf', 'tranexamic acid', 'kojic acid', 'arbutin']
-  },
-  wrinkles: {
-    risky: ['fragrance', 'alcohol denat'],
-    helpful: ['retinol', 'retinal', 'peptide', 'vitamin c', 'spf', 'bakuchiol']
-  },
-  texture: {
-    risky: ['heavy silicone', 'pore-clogging', 'comedogenic'],
-    helpful: ['aha', 'bha', 'exfoliant', 'retinol', 'niacinamide']
-  },
-  dark_circles: {
-    risky: ['fragrance', 'alcohol denat'],
-    helpful: ['caffeine', 'vitamin k', 'peptide', 'retinol']
+// Ingredients that specifically interact with a given skin concern.
+const RISK_KEYWORDS: Record<string, string[]> = {
+  redness: ['fragrance', 'parfum', 'alcohol denat', 'menthol', 'essential oil', 'witch hazel', 'sulfate'],
+  acne: ['coconut oil', 'isopropyl myristate', 'heavy silicone', 'dimethicone', 'mineral oil', 'cocoa butter'],
+  oiliness: ['heavy oil', 'petrolatum', 'shea butter', 'coconut oil', 'mineral oil'],
+  dark_circles: ['fragrance', 'parfum', 'alcohol denat', 'retinol'],
+  dryness: ['sulfate', 'sls', 'sles', 'alcohol denat', 'clay'],
+  sensitivity: ['fragrance', 'parfum', 'alcohol denat', 'menthol', 'essential oil', 'acid', 'retinol']
+};
+
+// Ingredients that are broadly irritating regardless of which specific
+// metric key they're mapped to above — these get checked against ANY
+// below-threshold metric, not just their "assigned" one.
+const GENERIC_IRRITANTS = ['fragrance', 'parfum', 'alcohol denat', 'sulfate', 'sls', 'sles', 'menthol', 'essential oil'];
+
+// Product categories this skin-metric checker genuinely can't evaluate well.
+// Scalp is arguably skin, but shampoo/conditioner formulas are optimized for
+// hair fiber, not facial skin barrier — so we flag rather than silently
+// score them "good_fit" against unrelated metrics.
+const OFF_TOPIC_CATEGORIES: { pattern: RegExp; label: string }[] = [
+  { pattern: /\b(shampoo|conditioner|hair\s*mask|hair\s*oil|leave-?in)\b/i, label: 'haircare' },
+  { pattern: /\b(deodorant|antiperspirant)\b/i, label: 'deodorant' },
+  { pattern: /\b(toothpaste|mouthwash)\b/i, label: 'oral care' }
+];
+
+function detectOffTopicCategory(desc: string): string | null {
+  for (const { pattern, label } of OFF_TOPIC_CATEGORIES) {
+    if (pattern.test(desc)) return label;
   }
-};
+  return null;
+}
 
-export async function checkPurchaseFit(
-  metrics: SkinMetric[],
-  productDescription: string
-): Promise<PurchaseVerdict> {
+function heuristicFallback(metrics: SkinMetric[], productDescription: string): PurchaseVerdict {
   const lowerDesc = productDescription.toLowerCase();
-  // Lower-scoring metrics (< 55) are where a mismatched ingredient
-  // actually matters; check both directions so the fallback can say
-  // something other than "good fit" for the common case where nothing
-  // is outright risky but also nothing addresses the person's actual
-  // low scores.
-  const priorityMetrics = metrics.filter((m) => m.score < 55);
-  const flaggedConcerns = priorityMetrics.filter((m) => {
-    const kw = RISK_KEYWORDS[m.key];
-    return kw?.risky.some((k) => lowerDesc.includes(k));
-  });
-  const addressedConcerns = priorityMetrics.filter((m) => {
-    const kw = RISK_KEYWORDS[m.key];
-    return kw?.helpful.some((k) => lowerDesc.includes(k));
-  });
 
-  try {
-    const raw = await callGroq(
-      'You are a skincare purchase advisor. Given the shopper\'s current skin metric scores (0-100, higher is ' +
-        'healthier) and a product description, decide if the product is a "good_fit", needs "caution", or is a ' +
-        '"poor_fit" for them right now. Respond as three lines exactly in this format:\n' +
-        'VERDICT: <good_fit|caution|poor_fit>\nHEADLINE: <one short sentence, no more than 12 words>\n' +
-        'REASONING: <2-3 sentences, specific to their lowest scores and the product, no medical claims>',
-      `Skin metrics: ${metrics.map((m) => `${m.label} ${m.score}`).join(', ')}.\n` +
-        `Product: ${productDescription}`
-    );
-
-    const verdictMatch = raw.match(/VERDICT:\s*(good_fit|caution|poor_fit)/i);
-    const headlineMatch = raw.match(/HEADLINE:\s*(.+)/i);
-    const reasoningMatch = raw.match(/REASONING:\s*([\s\S]+)/i);
-
-    if (verdictMatch) {
-      return {
-        verdict: verdictMatch[1].toLowerCase() as PurchaseVerdict['verdict'],
-        headline: headlineMatch?.[1]?.trim() || 'Here is how this fits your skin right now.',
-        reasoning: reasoningMatch?.[1]?.trim() || raw
-      };
-    }
-    console.error('[groq] checkPurchaseFit: response did not match expected VERDICT/HEADLINE/REASONING format, using heuristic', { raw });
-  } catch (err) {
-    console.error('[groq] checkPurchaseFit falling back to heuristic:', err instanceof Error ? err.message : err);
-  }
-
-  // Heuristic fallback (Groq unavailable or gave an unparseable response).
-  // Ranked so it can actually land on poor_fit / caution / good_fit
-  // differently depending on the product text, instead of only ever
-  // producing "caution" or the same generic "good_fit" regardless of input.
-  if (flaggedConcerns.length >= 2) {
-    return {
-      verdict: 'poor_fit',
-      headline: `Likely to aggravate ${flaggedConcerns.length} of your current concerns`,
-      reasoning:
-        `Your ${flaggedConcerns.map((c) => c.label.toLowerCase()).join(' and ')} scores are currently on the ` +
-        `lower side, and this product's description includes ingredients that commonly aggravate more than one ` +
-        `of those. This is probably not the right pick while those scores are low — look for a gentler, ` +
-        `fragrance-light alternative instead.`
-    };
-  }
-
-  if (flaggedConcerns.length === 1) {
+  const offTopic = detectOffTopicCategory(lowerDesc);
+  if (offTopic) {
     return {
       verdict: 'caution',
-      headline: `May aggravate your ${flaggedConcerns[0].label.toLowerCase()}`,
+      offTopic: true,
+      headline: `This is a ${offTopic} product, not a skin one`,
       reasoning:
-        `Your ${flaggedConcerns[0].label.toLowerCase()} score is currently on the lower side (${flaggedConcerns[0].score}/100), ` +
-        `and this product's description includes ingredients that commonly interact with that concern. ` +
-        `Consider patch-testing first, or look for an alternative without those ingredients.`
+        `Your skin snapshot tracks facial skin metrics, so it isn't a great judge of ${offTopic} products. ` +
+        `If it touches your skin directly (e.g. shampoo running down your face/neck), consider checking the ` +
+        `ingredient list against ingredients that tend to bother your lower-scoring areas, and patch-test first.`
     };
   }
 
-  if (addressedConcerns.length > 0) {
+  // Metrics below this line get flagged if a risky ingredient shows up.
+  const LOW_SCORE_THRESHOLD = 65;
+  const lowMetrics = metrics.filter((m) => m.score < LOW_SCORE_THRESHOLD);
+
+  const flagged = lowMetrics.filter((m) => {
+    const specific = RISK_KEYWORDS[m.key] || [];
+    const combined = [...new Set([...specific, ...GENERIC_IRRITANTS])];
+    return combined.some((kw) => lowerDesc.includes(kw));
+  });
+
+  if (flagged.length > 0) {
+    const worst = flagged.slice().sort((a, b) => a.score - b.score)[0];
     return {
-      verdict: 'good_fit',
-      headline: `Targets your ${addressedConcerns[0].label.toLowerCase()}`,
+      verdict: worst.score < 45 ? 'poor_fit' : 'caution',
+      headline: `May aggravate your ${worst.label.toLowerCase()}`,
       reasoning:
-        `Your ${addressedConcerns.map((c) => c.label.toLowerCase()).join(' and ')} score${
-          addressedConcerns.length > 1 ? 's are' : ' is'
-        } currently on the lower side, and this product's description includes ingredients commonly used to ` +
-        `address that. Nothing in the description conflicts with your other scores. Patch-test first as always.`
+        `Your ${flagged.map((c) => c.label.toLowerCase()).join(' and ')} score${
+          flagged.length > 1 ? 's are' : ' is'
+        } currently on the lower side, and this product's description includes ingredients that commonly ` +
+        `interact with that concern. Consider patch-testing first, or look for a fragrance-light alternative.`
     };
   }
 
-  if (priorityMetrics.length > 0) {
+  // No keyword match — but if metrics are generally low, don't blanket-approve either.
+  const anyVeryLow = metrics.some((m) => m.score < 40);
+  if (anyVeryLow) {
     return {
-      verdict: 'good_fit',
-      headline: "Nothing here conflicts with your current snapshot",
+      verdict: 'caution',
+      headline: 'A few of your scores are quite low right now',
       reasoning:
-        `Nothing in this product's description conflicts with your lower-scoring areas (${priorityMetrics
-          .map((m) => m.label.toLowerCase())
-          .join(', ')}), though it also doesn't specifically target them based on the description alone. ` +
-        `Patch-test new products on a small area first.`
+        'Nothing in the description obviously conflicts with your metrics, but since some scores are quite low ' +
+        'right now, ease it in gradually and patch-test before full use rather than treating this as a clear green light.'
     };
   }
 
@@ -240,6 +171,55 @@ export async function checkPurchaseFit(
     verdict: 'good_fit',
     headline: 'Looks compatible with your current skin snapshot',
     reasoning:
-      "Your metrics are all in a healthy range right now, and nothing in this product's description raises a flag. As always, patch-test new products on a small area first."
+      'Nothing in this product description conflicts with your lowest-scoring metrics today. As always, patch-test new products on a small area first.'
   };
+}
+
+function parseGroqVerdict(raw: string): PurchaseVerdict | null {
+  // Strip markdown bold/italics/backticks the model sometimes adds despite instructions.
+  const cleaned = raw.replace(/[*_`]/g, '');
+
+  const verdictMatch = cleaned.match(/VERDICT:\s*(good_fit|caution|poor_fit)/i);
+  const headlineMatch = cleaned.match(/HEADLINE:\s*(.+)/i);
+  const reasoningMatch = cleaned.match(/REASONING:\s*([\s\S]+)/i);
+
+  if (!verdictMatch) return null;
+
+  return {
+    verdict: verdictMatch[1].toLowerCase() as PurchaseVerdict['verdict'],
+    headline: headlineMatch?.[1]?.trim() || 'Here is how this fits your skin right now.',
+    reasoning: reasoningMatch?.[1]?.trim() || cleaned.trim()
+  };
+}
+
+export async function checkPurchaseFit(
+  metrics: SkinMetric[],
+  productDescription: string
+): Promise<PurchaseVerdict> {
+  const offTopic = detectOffTopicCategory(productDescription.toLowerCase());
+
+  try {
+    const raw = await callGroq(
+      'You are a skincare purchase advisor. Given the shopper\'s current skin metric scores (0-100, higher is ' +
+        'healthier) and a product description, decide if the product is a "good_fit", needs "caution", or is a ' +
+        '"poor_fit" for them right now. If the product is not primarily a facial skincare product (e.g. shampoo, ' +
+        'deodorant, toothpaste), say so plainly in the reasoning and default to "caution" rather than "good_fit", ' +
+        'since the skin metrics don\'t meaningfully evaluate it. Be willing to say "caution" or "poor_fit" when ' +
+        'warranted — don\'t default to "good_fit" just because nothing obviously conflicts. Respond as three lines ' +
+        'exactly in this format, with no markdown formatting, no preamble, no extra commentary:\n' +
+        'VERDICT: <good_fit|caution|poor_fit>\nHEADLINE: <one short sentence, no more than 12 words>\n' +
+        'REASONING: <2-3 sentences, specific to their lowest scores and the product, no medical claims>',
+      `Skin metrics: ${metrics.map((m) => `${m.label} ${m.score}`).join(', ')}.\n` +
+        `Product: ${productDescription}`
+    );
+
+    const parsed = parseGroqVerdict(raw);
+    if (parsed) return parsed;
+
+    console.warn('[groq] could not parse purchase-fit response, falling back to heuristic. Raw:', raw);
+  } catch {
+    // fall through to heuristic
+  }
+
+  return heuristicFallback(metrics, productDescription);
 }
