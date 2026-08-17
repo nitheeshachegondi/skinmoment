@@ -147,7 +147,12 @@ async function pollTask(taskId: string): Promise<any> {
       return data.data ?? data;
     }
     if (status === 'error') {
-      throw new Error('YouCam skin analysis task failed');
+      // YouCam returns a specific error/error_code on failed tasks (e.g.
+      // error_src_face_too_small, error_lighting_dark, error_no_face) —
+      // surface it instead of a generic message so the cause is obvious.
+      const errBody = data.data ?? data;
+      const reason = errBody?.error_code || errBody?.error || JSON.stringify(errBody);
+      throw new Error(`YouCam skin analysis task failed: ${reason}`);
     }
     // status === 'running' (or anything else transient) -> keep polling
 
