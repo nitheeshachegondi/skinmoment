@@ -47,12 +47,6 @@ export default function ResultsPanel({ metrics, plan, demo }: Props) {
 
   return (
     <div className="flex flex-col gap-6">
-      {demo && (
-        <div className="rounded-xl bg-[#d98a4a]/15 border border-[#d98a4a]/40 text-[#8a5a2c] text-xs px-4 py-2">
-          Demo mode: showing sample YouCam Skin AI output. Add <code>YOUCAM_API_KEY</code> in{' '}
-          <code>.env.local</code> to run live analysis.
-        </div>
-      )}
 
       <div className="bg-white/70 backdrop-blur rounded-3xl card-shadow p-6 md:p-8 border border-white">
         <p className="text-xs uppercase tracking-widest text-clay font-semibold mb-2">Your snapshot</p>
